@@ -6,6 +6,7 @@
 #include <iostream>
 #include <vector>
 #include <stack>
+#include <queue>
 #include <nan.h>
 #include <stdio.h>
 
@@ -53,6 +54,20 @@ class MsgpackZone {
         }
 };
 
+struct msgpack_packet {
+    Local<Value> v8obj;
+    msgpack_object *mo;
+    msgpack_zone *mz;
+    size_t depth;
+};
+
+struct msgpack_packet_s {
+    Local<Value> v8val;
+    Local<Object> v8obj;
+    Local<Array> v8arr;
+    msgpack_object *mo;
+};
+
 static stack<msgpack_sbuffer *> sbuffers;
 
 #define DBG_PRINT_BUF(buf, name) \
@@ -92,6 +107,7 @@ _free_sbuf(char *data, void *hint) {
     }
 }
 
+
 // Convert a V8 object to a MessagePack object.
 //
 // This method is recursive. It will probably blow out the stack on objects
@@ -100,89 +116,177 @@ _free_sbuf(char *data, void *hint) {
 // If a circular reference is detected, an exception is thrown.
 static void
 v8_to_msgpack(Local<Value> v8obj, msgpack_object *mo, msgpack_zone *mz, size_t depth) {
-    if (512 < ++depth) {
-        throw MsgpackException("Cowardly refusing to pack object with circular reference");
-    }
+    stack<msgpack_packet *> msgpack_packets;
+    msgpack_packet *newmp = new msgpack_packet();
+    newmp->depth = depth;
+    newmp->mz = mz;
+    newmp->mo = mo;
+    newmp->v8obj = v8obj;
+    msgpack_packets.push(newmp);
+    msgpack_packet *mp;
+    while (!msgpack_packets.empty()) {
+        mp = msgpack_packets.top();
+        Local<Value> v8obj = mp->v8obj;
+        msgpack_object *mo = mp->mo;
+        msgpack_zone *mz = mp->mz;
+        size_t depth = mp->depth + 1;
+        if (512 < depth) {
+            throw MsgpackException("Cowardly refusing to pack object with circular reference");
+        }
+        msgpack_packets.pop(); 
+        if (v8obj->IsUndefined() || v8obj->IsNull()) {
+            mo->type = MSGPACK_OBJECT_NIL;
+        } else if (v8obj->IsBoolean()) {
+            mo->type = MSGPACK_OBJECT_BOOLEAN;
+            mo->via.boolean = Nan::To<bool>(v8obj).FromJust();
+        } else if (v8obj->IsNumber()) {
+            double d = Nan::To<double>(v8obj).FromJust();
+            if (trunc(d) != d) {
+                mo->type = MSGPACK_OBJECT_FLOAT;
+                mo->via.f64 = d;
+            } else if (d > 0) {
+                mo->type = MSGPACK_OBJECT_POSITIVE_INTEGER;
+                mo->via.u64 = static_cast<uint64_t>(d);
+            } else {
+                mo->type = MSGPACK_OBJECT_NEGATIVE_INTEGER;
+                mo->via.i64 = static_cast<int64_t>(d);
+            }
+        } else if (v8obj->IsString()) {
+            mo->type = MSGPACK_OBJECT_STR;
+            mo->via.str.size = static_cast<uint32_t>(Nan::DecodeBytes(v8obj, Nan::Encoding::UTF8));
+            mo->via.str.ptr = (char*) msgpack_zone_malloc(mz, mo->via.str.size);
 
-    if (v8obj->IsUndefined() || v8obj->IsNull()) {
-        mo->type = MSGPACK_OBJECT_NIL;
-    } else if (v8obj->IsBoolean()) {
-        mo->type = MSGPACK_OBJECT_BOOLEAN;
-        mo->via.boolean = Nan::To<bool>(v8obj).FromJust();
-    } else if (v8obj->IsNumber()) {
-        double d = Nan::To<double>(v8obj).FromJust();
-        if (trunc(d) != d) {
-            mo->type = MSGPACK_OBJECT_FLOAT;
-            mo->via.f64 = d;
-        } else if (d > 0) {
-            mo->type = MSGPACK_OBJECT_POSITIVE_INTEGER;
-            mo->via.u64 = static_cast<uint64_t>(d);
+            Nan::DecodeWrite((char*)mo->via.str.ptr, mo->via.str.size, v8obj, Nan::Encoding::UTF8);
+        } else if (v8obj->IsDate()) {
+            mo->type = MSGPACK_OBJECT_STR;
+            Local<Date> date = Local<Date>::Cast(v8obj);
+            Local<Function> func = Local<Function>::Cast(Nan::Get(date, Nan::New<String>("toISOString").ToLocalChecked()).ToLocalChecked());
+            Local<Value> argv[1] = {};
+            Local<Value> result = Nan::Call(func, date, 0, argv).ToLocalChecked();
+            mo->via.str.size = static_cast<uint32_t>(Nan::DecodeBytes(result, Nan::Encoding::UTF8));
+            mo->via.str.ptr = (char*) msgpack_zone_malloc(mz, mo->via.str.size);
+
+            Nan::DecodeWrite((char*)mo->via.str.ptr, mo->via.str.size, result, Nan::Encoding::UTF8);
+        } else if (v8obj->IsArray()) {
+            Local<Object> o = Nan::To<v8::Object>(v8obj).ToLocalChecked();
+            Local<Array> a = Local<Array>::Cast(o);
+
+            mo->type = MSGPACK_OBJECT_ARRAY;
+            mo->via.array.size = a->Length();
+            mo->via.array.ptr = (msgpack_object*) msgpack_zone_malloc(
+                mz,
+                sizeof(msgpack_object) * mo->via.array.size
+            );
+
+            for (uint32_t i = 0; i < a->Length(); i++) {
+                Local<Value> v = Nan::Get(a, i).ToLocalChecked();
+                msgpack_packet *newmp = new msgpack_packet();
+                newmp->depth = depth;
+                newmp->mz = mz;
+                newmp->mo = &mo->via.array.ptr[i];
+                newmp->v8obj = v;
+                msgpack_packets.push(newmp);
+            }
+        } else if (Buffer::HasInstance(v8obj)) {
+            Local<Object> buf = Nan::To<Object>(v8obj).ToLocalChecked();
+
+            mo->type = MSGPACK_OBJECT_BIN;
+            mo->via.bin.size = static_cast<uint32_t>(Buffer::Length(buf));
+            mo->via.bin.ptr = Buffer::Data(buf);
         } else {
-            mo->type = MSGPACK_OBJECT_NEGATIVE_INTEGER;
-            mo->via.i64 = static_cast<int64_t>(d);
+            Local<Object> o = Nan::To<Object>(v8obj).ToLocalChecked();
+            Local<String> toJSON = Nan::New<String>("toJSON").ToLocalChecked();
+            // for o.toJSON()
+            if (Nan::Has(o, toJSON).FromJust() && Nan::Get(o, toJSON).ToLocalChecked()->IsFunction()) {
+                Local<Function> fn = Local<Function>::Cast(Nan::Get(o, toJSON).ToLocalChecked());
+                msgpack_packet *newmp = new msgpack_packet();
+                newmp->depth = depth;
+                newmp->mz = mz;
+                newmp->mo = mo;
+                newmp->v8obj = Nan::Call(fn, o, 0, NULL).ToLocalChecked();
+                msgpack_packets.push(newmp);
+                continue;
+            }
+
+            Local<Array> a = Nan::GetPropertyNames(o).ToLocalChecked();
+
+            mo->type = MSGPACK_OBJECT_MAP;
+            mo->via.map.size = a->Length();
+            mo->via.map.ptr = (msgpack_object_kv*) msgpack_zone_malloc(
+                mz,
+                sizeof(msgpack_object_kv) * mo->via.map.size
+            );
+
+            for (uint32_t i = 0; i < a->Length(); i++) {
+                Local<Value> k = Nan::Get(a, i).ToLocalChecked();
+                msgpack_packet *newmp1 = new msgpack_packet();
+                newmp1->depth = depth;
+                newmp1->mz = mz;
+                newmp1->mo = &mo->via.map.ptr[i].key;
+                newmp1->v8obj = k;
+                msgpack_packets.push(newmp1);
+                msgpack_packet *newmp2 = new msgpack_packet();
+                newmp2->depth = depth;
+                newmp2->mz = mz;
+                newmp2->mo = &mo->via.map.ptr[i].val;
+                newmp2->v8obj = Nan::Get(o, k).ToLocalChecked();
+                msgpack_packets.push(newmp2);
+            }
         }
-    } else if (v8obj->IsString()) {
-        mo->type = MSGPACK_OBJECT_STR;
-        mo->via.str.size = static_cast<uint32_t>(Nan::DecodeBytes(v8obj, Nan::Encoding::UTF8));
-        mo->via.str.ptr = (char*) msgpack_zone_malloc(mz, mo->via.str.size);
+    }
+}
 
-        Nan::DecodeWrite((char*)mo->via.str.ptr, mo->via.str.size, v8obj, Nan::Encoding::UTF8);
-    } else if (v8obj->IsDate()) {
-        mo->type = MSGPACK_OBJECT_STR;
-        Local<Date> date = Local<Date>::Cast(v8obj);
-        Local<Function> func = Local<Function>::Cast(Nan::Get(date, Nan::New<String>("toISOString").ToLocalChecked()).ToLocalChecked());
-        Local<Value> argv[1] = {};
-        Local<Value> result = Nan::Call(func, date, 0, argv).ToLocalChecked();
-        mo->via.str.size = static_cast<uint32_t>(Nan::DecodeBytes(result, Nan::Encoding::UTF8));
-        mo->via.str.ptr = (char*) msgpack_zone_malloc(mz, mo->via.str.size);
 
-        Nan::DecodeWrite((char*)mo->via.str.ptr, mo->via.str.size, result, Nan::Encoding::UTF8);
-    } else if (v8obj->IsArray()) {
-        Local<Object> o = Nan::To<v8::Object>(v8obj).ToLocalChecked();
-        Local<Array> a = Local<Array>::Cast(o);
+static Local<Value>
+get_local_value(msgpack_packet_s *mpo, msgpack_object *mo) {
+    mpo->mo = mo;
 
-        mo->type = MSGPACK_OBJECT_ARRAY;
-        mo->via.array.size = a->Length();
-        mo->via.array.ptr = (msgpack_object*) msgpack_zone_malloc(
-            mz,
-            sizeof(msgpack_object) * mo->via.array.size
-        );
+    switch (mo->type) {
+    case MSGPACK_OBJECT_NIL:
+        mpo->v8val = Nan::Null();
+        return mpo->v8val;
 
-        for (uint32_t i = 0; i < a->Length(); i++) {
-            Local<Value> v = Nan::Get(a, i).ToLocalChecked();
-            v8_to_msgpack(v, &mo->via.array.ptr[i], mz, depth);
-        }
-    } else if (Buffer::HasInstance(v8obj)) {
-        Local<Object> buf = Nan::To<Object>(v8obj).ToLocalChecked();
+    case MSGPACK_OBJECT_BOOLEAN:
+        mpo->v8val = (mo->via.boolean) ?
+            Nan::True() :
+            Nan::False();
+        return mpo->v8val;
 
-        mo->type = MSGPACK_OBJECT_BIN;
-        mo->via.bin.size = static_cast<uint32_t>(Buffer::Length(buf));
-        mo->via.bin.ptr = Buffer::Data(buf);
-    } else {
-        Local<Object> o = Nan::To<Object>(v8obj).ToLocalChecked();
-        Local<String> toJSON = Nan::New<String>("toJSON").ToLocalChecked();
-        // for o.toJSON()
-        if (Nan::Has(o, toJSON).FromJust() && Nan::Get(o, toJSON).ToLocalChecked()->IsFunction()) {
-            Local<Function> fn = Local<Function>::Cast(Nan::Get(o, toJSON).ToLocalChecked());
-            v8_to_msgpack(Nan::Call(fn, o, 0, NULL).ToLocalChecked(), mo, mz, depth);
-            return;
-        }
+    case MSGPACK_OBJECT_POSITIVE_INTEGER:
+        // As per Issue #42, we need to use the base Number
+        // class as opposed to the subclass Integer, since
+        // only the former takes 64-bit inputs. Using the
+        // Integer subclass will truncate 64-bit values.
+        mpo->v8val = Nan::New<Number>(static_cast<double>(mo->via.u64));
+        return mpo->v8val;
 
-        Local<Array> a = Nan::GetPropertyNames(o).ToLocalChecked();
+    case MSGPACK_OBJECT_NEGATIVE_INTEGER:
+        // See comment for MSGPACK_OBJECT_POSITIVE_INTEGER
+        mpo->v8val =  Nan::New<Number>(static_cast<double>(mo->via.i64));
+        return mpo->v8val;
 
-        mo->type = MSGPACK_OBJECT_MAP;
-        mo->via.map.size = a->Length();
-        mo->via.map.ptr = (msgpack_object_kv*) msgpack_zone_malloc(
-            mz,
-            sizeof(msgpack_object_kv) * mo->via.map.size
-        );
+    case MSGPACK_OBJECT_FLOAT:
+        mpo->v8val =  Nan::New<Number>(mo->via.f64);
+        return mpo->v8val;
 
-        for (uint32_t i = 0; i < a->Length(); i++) {
-            Local<Value> k = Nan::Get(a, i).ToLocalChecked();
+    case MSGPACK_OBJECT_STR:
+        mpo->v8val =  Nan::New<String>(mo->via.str.ptr, mo->via.str.size).ToLocalChecked();
+        return mpo->v8val;
 
-            v8_to_msgpack(k, &mo->via.map.ptr[i].key, mz, depth);
-            v8_to_msgpack(Nan::Get(o, k).ToLocalChecked(), &mo->via.map.ptr[i].val, mz, depth);
-        }
+    case MSGPACK_OBJECT_BIN:
+        mpo->v8val = Nan::CopyBuffer(mo->via.str.ptr, mo->via.bin.size).ToLocalChecked();
+        return mpo->v8val;
+
+    case MSGPACK_OBJECT_ARRAY:
+        mpo->v8arr  = Nan::New<Array>(mo->via.array.size);
+        return mpo->v8arr;
+
+    case MSGPACK_OBJECT_MAP:
+        mpo->v8obj =  Nan::New<Object>();
+        return mpo->v8obj;
+
+    default:
+        throw MsgpackException("Encountered unknown MesssagePack object type");
     }
 }
 
@@ -192,61 +296,54 @@ v8_to_msgpack(Local<Value> v8obj, msgpack_object *mo, msgpack_zone *mz, size_t d
 // with extremely deep nesting.
 static Local<Value>
 msgpack_to_v8(msgpack_object *mo) {
-    switch (mo->type) {
-    case MSGPACK_OBJECT_NIL:
-        return Nan::Null();
-
-    case MSGPACK_OBJECT_BOOLEAN:
-        return (mo->via.boolean) ?
-            Nan::True() :
-            Nan::False();
-
-    case MSGPACK_OBJECT_POSITIVE_INTEGER:
-        // As per Issue #42, we need to use the base Number
-        // class as opposed to the subclass Integer, since
-        // only the former takes 64-bit inputs. Using the
-        // Integer subclass will truncate 64-bit values.
-        return Nan::New<Number>(static_cast<double>(mo->via.u64));
-
-    case MSGPACK_OBJECT_NEGATIVE_INTEGER:
-        // See comment for MSGPACK_OBJECT_POSITIVE_INTEGER
-        return Nan::New<Number>(static_cast<double>(mo->via.i64));
-
-    case MSGPACK_OBJECT_FLOAT:
-        return Nan::New<Number>(mo->via.f64);
-
-    case MSGPACK_OBJECT_ARRAY: {
-        Local<Array> a = Nan::New<Array>(mo->via.array.size);
-
-        for (uint32_t i = 0; i < mo->via.array.size; i++) {
-            Nan::Set(a, i, msgpack_to_v8(&mo->via.array.ptr[i]));
+    queue<msgpack_packet_s *> v8objs;
+    msgpack_packet_s *mpo = new msgpack_packet_s();
+    get_local_value(mpo, mo);
+    v8objs.push(mpo);
+    msgpack_packet_s *temp;
+    while (!v8objs.empty())
+    {
+        temp = v8objs.front();
+        msgpack_object *mo = temp->mo;
+        v8objs.pop();
+        if (mo->type == MSGPACK_OBJECT_ARRAY) {
+            for (uint32_t i = 0; i < mo->via.array.size; i++) {
+                msgpack_packet_s *mpo = new msgpack_packet_s();
+                Nan::Set(temp->v8arr, i, get_local_value(mpo, &mo->via.array.ptr[i]));
+                if (mo->via.array.ptr[i].type == MSGPACK_OBJECT_ARRAY || 
+                    mo->via.array.ptr[i].type == MSGPACK_OBJECT_MAP){
+                    v8objs.push(mpo);
+                }
+            }
+        } else if (mo->type == MSGPACK_OBJECT_MAP) {
+            for (uint32_t i = 0; i < mo->via.map.size; i++) {
+                msgpack_packet_s *mpok = new msgpack_packet_s();
+                msgpack_packet_s *mpov = new msgpack_packet_s();
+                Nan::Set(
+                    temp->v8obj,
+                    get_local_value(mpok, &mo->via.map.ptr[i].key),
+                    get_local_value(mpov, &mo->via.map.ptr[i].val)
+                );
+                if (mo->via.map.ptr[i].key.type == MSGPACK_OBJECT_ARRAY || 
+                    mo->via.map.ptr[i].key.type == MSGPACK_OBJECT_MAP){
+                    v8objs.push(mpok);
+                }
+                if (mo->via.map.ptr[i].val.type == MSGPACK_OBJECT_ARRAY || 
+                    mo->via.map.ptr[i].val.type == MSGPACK_OBJECT_MAP){
+                    v8objs.push(mpov);
+                }
+            }
+        } else {
+            msgpack_packet_s *mpo = new msgpack_packet_s();
+            temp->v8val = get_local_value(mpo, mo);
         }
-
-        return a;
     }
-
-    case MSGPACK_OBJECT_STR:
-        return Nan::New<String>(mo->via.str.ptr, mo->via.str.size).ToLocalChecked();
-
-    case MSGPACK_OBJECT_BIN:
-        return Nan::CopyBuffer(mo->via.str.ptr, mo->via.bin.size).ToLocalChecked();
-    case MSGPACK_OBJECT_MAP: {
-        Local<Object> o = Nan::New<Object>();
-
-        for (uint32_t i = 0; i < mo->via.map.size; i++) {
-            Nan::Set(
-                o,
-                msgpack_to_v8(&mo->via.map.ptr[i].key),
-                msgpack_to_v8(&mo->via.map.ptr[i].val)
-            );
-        }
-
-        return o;
+    if (mo->type == MSGPACK_OBJECT_ARRAY) {
+        return mpo->v8arr;
+    } else if (mo->type == MSGPACK_OBJECT_MAP) {
+        return mpo->v8obj;
     }
-
-    default:
-        throw MsgpackException("Encountered unknown MesssagePack object type");
-    }
+    return mpo->v8val;
 }
 
 // var buf = msgpack.pack(obj[, obj ...]);
